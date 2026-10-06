@@ -176,6 +176,66 @@ class TestIntegration(unittest.TestCase):
         self.assertAlmostEqual(r["volume_net"], V_CONE, delta=0.01 * V_CONE)
         self.assertAlmostEqual(r["surface_2d"], math.pi * 144, delta=0.01 * math.pi * 144)
 
+    def test_talus_declare_dans_le_calque_epaulements(self):
+        """Stock adossé à un talus au pied caché : polygone sur la face visible."""
+        def sol(x, y):
+            return 100.0 + 0.8 * max(0.0, (x - X0) - 8.0)
+
+        def surface(x, y):
+            u, v = x - X0, y - Y0
+            dessus = 104.0 - 0.7 * max(0.0, 6.0 - u) - 0.7 * max(0.0, 6.0 - v) - 0.7 * max(0.0, v - 24.0)
+            return max(sol(x, y), dessus)
+        self.mne.fonction = surface
+        formes = self.chunk.shapes
+        for s in list(formes):
+            formes.remove(s)
+        g_stocks = [g for g in formes.groups if g.label == "Stocks"][0]
+        g_ep = formes.addGroup()
+        g_ep.label = "Épaulements"  # accents et majuscules ignorés
+
+        def rectangle(x1, y1, x2, y2):
+            dx, dy = DECALAGE_FORMES
+            return fm.Geometry.Polygon([fm.Vector([X0 + x + dx, Y0 + y + dy, 0.0])
+                                        for x, y in ((x1, y1), (x2, y1), (x2, y2), (x1, y2))])
+        stock = formes.addShape()
+        stock.label, stock.group, stock.geometry = "Stock talus", g_stocks, rectangle(-1, -1, 13, 31)
+        face = formes.addShape()
+        face.label, face.group, face.geometry = "Talus nord", g_ep, rectangle(13.5, -1, 17, 31)
+        sortie = vs.executer({"fichier_csv": os.path.join(self.dossier, "t.csv")})
+        r = sortie["resultats"][0]
+        pas = 0.05
+        attendu = sum(surface(X0 - 1 + (i + 0.5) * pas, Y0 - 1 + (j + 0.5) * pas)
+                      - sol(X0 - 1 + (i + 0.5) * pas, Y0 - 1 + (j + 0.5) * pas)
+                      for i in range(280) for j in range(640)) * pas * pas
+        self.assertAlmostEqual(r["volume_net"], attendu, delta=0.01 * attendu)
+        self.assertEqual(r["epaulements_inclines"], ["Talus nord : 80 %"])
+        ligne = self.lire_csv(sortie["csv"])[0]
+        self.assertEqual(ligne["Épaulements inclinés (pente)"], "Talus nord : 80 %")
+        self.assertNotIn("Tonnage (t)", ligne)  # pas de densité : volumes seuls
+
+    def test_scr_en_pieds_resultat_en_m3(self):
+        crs_ft = fm.CoordinateSystem(
+            'PROJCS["NAD83 / Ohio North (ftUS)",GEOGCS["NAD83",UNIT["degree",0.0174532925199433]],'
+            'UNIT["US survey foot",0.304800609601219]]')
+        pied = 0.304800609601219
+        cx, cy = 2000000.0, 600000.0
+
+        def surface_ft(x, y):
+            r = math.hypot((x - cx) * pied, (y - cy) * pied)
+            return (100.0 + max(0.0, H * (1.0 - r / R))) / pied
+        chunk = fm.Chunk("Pieds", crs_ft, [fm.Elevation(surface_ft, crs_ft, 0.1, "DEM ft")], crs_ft)
+        forme = chunk.shapes.addShape()
+        forme.label = "Stock ft"
+        forme.description = "methode=altitude; altitude=%.6f" % (100.0 / pied)
+        forme.geometry = fm.Geometry.Polygon([fm.Vector([cx + 12 / pied * math.cos(t * math.pi / 36),
+                                                         cy + 12 / pied * math.sin(t * math.pi / 36)])
+                                              for t in range(72)])
+        fm.app.document = fm.Document([chunk], os.path.join(self.dossier, "ft.psx"))
+        r = vs.executer({"pas_grille": 0.1, "formes_controle": False})["resultats"][0]
+        self.assertAlmostEqual(r["volume_net"], V_CONE, delta=0.01 * V_CONE)
+        self.assertAlmostEqual(r["surface_2d"], math.pi * 144, delta=0.01 * math.pi * 144)
+        self.assertAlmostEqual(r["hauteur_max"], H, delta=0.1)
+
     def test_menu_et_lancer_sans_qt(self):
         ancien_qt = vs.QtWidgets
         vs.QtWidgets = None

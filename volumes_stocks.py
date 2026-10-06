@@ -3,7 +3,7 @@
 Volumes de stocks - script Python pour Agisoft Metashape Professional
 =====================================================================
 
-Calcule automatiquement le volume (et le tonnage) de chaque stock dessiné sous
+Calcule automatiquement le volume (m3) de chaque stock dessiné sous
 forme de polygone dans Metashape, à partir d'un MNE (MNS) - sans classification
 préalable des points sol.
 
@@ -46,7 +46,7 @@ except ImportError:
         QtWidgets = None
 
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 LIBELLE_MENU = "Scripts/Volumes de stocks..."
 GROUPE_CONTROLE = "Controle volumes - pied ignore"
 
@@ -62,11 +62,16 @@ CONFIG = {
     # Polygones autour des éléments parasites (arbre, engin, bloc...) : le MNE y
     # est ignoré et reconstruit par interpolation. "" = aucun.
     "groupe_exclusions": "Exclusions",
-    # Lignes (ou polygones) le long des murs / épaulements / talus où le pied du
-    # stock n'est pas au niveau du sol : ces tronçons de pied sont ignorés pour
-    # estimer la base. "" = aucun.
+    # Épaulements contre lesquels le stock s'appuie. "" = aucun.
+    #  - LIGNE le long d'un mur vertical (blocs béton, front de roche vertical) :
+    #    le pied est ignoré le long de la ligne, la base du sol est prolongée ;
+    #  - POLYGONE sur la face VISIBLE d'un épaulement incliné (talus naturel ou
+    #    artificiel, flanc de roche incliné) : la pente de la face est prolongée
+    #    sous le stock jusqu'au sol (base = le plus haut des deux).
     "groupe_epaulements": "Epaulements",
     "tolerance_epaulement": 0.5,  # m : distance d'influence des lignes d'épaulement
+    "distance_epaulement": 5.0,   # m : un polygone d'épaulement s'applique aux stocks à moins de cette distance
+    "pente_min_epaulement": 10.0, # % : face moins pentue = non prolongée (alerte)
 
     # --- Surface du stock (MNE) -------------------------------------------------
     "mne": "",  # libellé du MNE à utiliser ; "" = MNE actif du chunk
@@ -94,7 +99,7 @@ CONFIG = {
     # --- Calcul -------------------------------------------------------------------
     "pas_grille": 0.0,        # m ; 0 = automatique (résolution du MNE, plafonnée)
     "max_cellules": 400000,   # nombre maximal de cellules par stock en mode automatique
-    "densite": 0.0,           # t/m3 ; 0 = pas de calcul de tonnage
+    "densite": 0.0,           # t/m3 ; 0 = volumes seuls (colonnes tonnage masquées)
 
     # --- Sorties ------------------------------------------------------------------
     "fichier_csv": "",        # "" = à côté du projet .psx
@@ -284,6 +289,31 @@ def distance_segment(px, py, ax, ay, bx, by):
     l2 = dx * dx + dy * dy
     t = 0.0 if l2 <= 0.0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / l2))
     return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def _segments(anneaux):
+    segs = []
+    for a in anneaux:
+        n = len(a)
+        for k in range(n):
+            segs.append((a[k][0], a[k][1], a[(k + 1) % n][0], a[(k + 1) % n][1]))
+    return segs
+
+
+def distance_polygones(a, b):
+    """Distance minimale entre deux polygones (listes d'anneaux) ; 0 s'ils se touchent."""
+    if any(point_dans(b, p[0], p[1]) for p in a[0]) or any(point_dans(a, p[0], p[1]) for p in b[0]):
+        return 0.0
+    d = float("inf")
+    for s in _segments(a):
+        for t in _segments(b):
+            p1, p2, p3, p4 = (s[0], s[1]), (s[2], s[3]), (t[0], t[1]), (t[2], t[3])
+            if ((_orient(p1, p2, p3) > 0) != (_orient(p1, p2, p4) > 0)
+                    and (_orient(p3, p4, p1) > 0) != (_orient(p3, p4, p2) > 0)):
+                return 0.0
+            d = min(d, distance_segment(s[0], s[1], *t), distance_segment(s[2], s[3], *t),
+                    distance_segment(t[0], t[1], *s), distance_segment(t[2], t[3], *s))
+    return d
 
 
 def densifier_anneau(anneau, pas):
@@ -616,17 +646,21 @@ class _Echantillon(object):
 
 
 def calculer_stock(parties, surface, params, exclusions=(), epaulements_lignes=(),
-                   epaulements_polygones=(), reference=None, progression=None):
+                   epaulements_polygones=(), reference=None, progression=None,
+                   noms_epaulements=None):
     """Calcule le volume d'un stock.
 
     parties    : liste de polygones ; polygone = [anneau extérieur, trou, ...] ;
                  anneau = [(x, y), ...] en coordonnées locales métriques.
-    surface    : fonction (x, y) -> altitude du MNE, ou None (pas de donnée).
+    surface    : fonction (x, y) -> altitude du MNE en mètres, ou None (pas de donnée).
     params     : dictionnaire (clés de CONFIG + "resolution_mne_m").
     exclusions : polygones (même format) où le MNE est ignoré puis interpolé.
-    epaulements_lignes / epaulements_polygones : tronçons de pied à ignorer.
+    epaulements_lignes : murs verticaux (blocs, front de roche) : pied ignoré le long.
+    epaulements_polygones : faces visibles d'épaulements inclinés (talus, flanc de
+                 roche) : pied ignoré et plan de la face prolongé sous le stock.
     reference  : fonction (x, y) -> altitude de la base (méthode mne_reference).
     progression: fonction(fraction) appelée régulièrement (rafraîchissement IHM).
+    noms_epaulements : libellés des polygones d'épaulement (pour les alertes).
     """
     alertes = []
     methode = methode_normalisee(params.get("methode_base", "plan"))
@@ -664,7 +698,7 @@ def calculer_stock(parties, surface, params, exclusions=(), epaulements_lignes=(
 
     excl = [p for p in ([nettoyer_anneau(a) for a in poly] for poly in exclusions)
             if p and len(p[0]) >= 3]
-    excl = [(p, emprise(p)) for p in excl if emprises_recouvrent(emprise(p), zone, 10 * pas)]
+    excl = [(p, emprise(p)) for p in excl if emprises_recouvrent(emprise(p), zone, 10 * pas + 100.0)]
 
     def exclu(x, y):
         for p, e in excl:
@@ -749,14 +783,23 @@ def calculer_stock(parties, surface, params, exclusions=(), epaulements_lignes=(
             ajouter_segments(anneau, True)
     segments_ep = [s for s in segments_ep if emprises_recouvrent(
         (min(s[0], s[2]), min(s[1], s[3]), max(s[0], s[2]), max(s[1], s[3])), zone, tol_ep + ds)]
-    polys_ep = [[nettoyer_anneau(a) for a in poly] for poly in epaulements_polygones]
+    polys_ep = []
+    for ie, poly in enumerate(epaulements_polygones):
+        anneaux = [nettoyer_anneau(a) for a in poly]
+        anneaux = [a for a in anneaux if len(a) >= 3]
+        if anneaux:
+            nom = (noms_epaulements[ie] if noms_epaulements and ie < len(noms_epaulements)
+                   else "n°%d" % (ie + 1))
+            polys_ep.append((anneaux, emprise([anneaux[0]]), nom))
+    polys_ep_pied = [(p, e) for p, e, _ in polys_ep if emprises_recouvrent(e, zone, tol_ep + ds)]
 
     for e in echantillons:
         e.z = surface(e.x, e.y)
         if exclu(e.x, e.y):
             e.raison = "exclusion"
         elif any(distance_segment(e.x, e.y, *s) <= tol_ep for s in segments_ep) or \
-                any(point_dans(p, e.x, e.y) for p in polys_ep):
+                any(em[0] <= e.x <= em[2] and em[1] <= e.y <= em[3] and point_dans(p, e.x, e.y)
+                    for p, em in polys_ep_pied):
             e.raison = "epaulement"
         elif e.z is None:
             e.raison = "sans_donnees"
@@ -836,6 +879,41 @@ def calculer_stock(parties, surface, params, exclusions=(), epaulements_lignes=(
             v = base_tin.get(cle)
             return v if v is not None else evaluer_modele(modele, x, y)
 
+    # --- 5 bis. Épaulements inclinés : la face visible est prolongée sous le stock --
+    plans_talus, pentes_talus = [], []
+    suivi_talus = {"n": 0}
+    if methode != "mne_reference" and polys_ep:
+        distance_max = float(params.get("distance_epaulement", 5.0))
+        pente_min = float(params.get("pente_min_epaulement", 10.0))
+        for anneaux_ep, emprise_ep, nom in polys_ep:
+            if not emprises_recouvrent(emprise_ep, zone, distance_max):
+                continue
+            if min(distance_polygones(anneaux_ep, p) for p in polys) > distance_max:
+                continue
+            modele_t = _plan_face(anneaux_ep, tous_anneaux, zone, surface, exclu, rejet, k_rejet, seuil_rejet)
+            if modele_t is None:
+                alertes.append("épaulement « %s » : pas assez de données MNE sur la face visible" % nom)
+                continue
+            pente_t = 100.0 * math.hypot(modele_t[1], modele_t[2])
+            if pente_t < pente_min:
+                alertes.append("épaulement « %s » presque horizontal (%.0f %%) : non prolongé sous le stock "
+                               "(pour un mur vertical, tracer une ligne)" % (nom, pente_t))
+                continue
+            plans_talus.append(modele_t)
+            pentes_talus.append("%s : %.0f %%" % (nom, pente_t))
+    if plans_talus:
+        base_sol = base
+
+        def base(cle, x, y):
+            zb = base_sol(cle, x, y)
+            if zb is None:
+                return None
+            zt = max(evaluer_modele(m, x, y) for m in plans_talus)
+            if zt > zb:
+                suivi_talus["n"] += 1
+                return zt
+            return zb
+
     # --- 6. Volumes -----------------------------------------------------------------
     aire_cellule = pas * pas
     v_dessus = v_dessous = 0.0
@@ -866,6 +944,10 @@ def calculer_stock(parties, surface, params, exclusions=(), epaulements_lignes=(
     v_dessus *= aire_cellule
     v_dessous *= aire_cellule
     volume_net = v_dessus - v_dessous
+    base_talus_pct = 100.0 * suivi_talus["n"] / nb_cellules if plans_talus else None
+    if base_talus_pct is not None and base_talus_pct > 60.0:
+        alertes.append("la base suit l'épaulement incliné sur %.0f %% de la surface : vérifier le "
+                       "polygone d'épaulement (face visible du talus uniquement)" % base_talus_pct)
 
     if methode == "mne_reference":
         if compteur["secours"] > 0.05 * nb_cellules:
@@ -944,6 +1026,8 @@ def calculer_stock(parties, surface, params, exclusions=(), epaulements_lignes=(
         "hauteur_moy": volume_net / surface_2d,
         "altitude_base_moy": somme_base / n_calc if n_calc else None,
         "pente_base_pct": pente,
+        "epaulements_inclines": pentes_talus or None,
+        "base_epaulement_pct": base_talus_pct,
         "pied_retenu_pct": pied_pct,
         "ecart_type_pied": ecart_type,
         "ecart_moyen_pied": ecart_moyen,
@@ -1070,6 +1154,38 @@ def _rasteriser(triangles, anneau, zs, z, base_tin, nx, ny, pas, xmin, ymin):
                     base_tin[cle] = w1 * zs[a] + w2 * zs[b] + w3 * zs[c]
 
 
+def _plan_face(anneaux, anneaux_stock, zone_stock, surface, exclu, rejet, k, seuil_min,
+               max_points=20000):
+    """Plan robuste ajusté sur la face visible d'un épaulement incliné.
+
+    Le MNE est lu dans le polygone d'épaulement, hors du stock et hors des
+    exclusions ; la végétation ou les blocs isolés sur la face sont rejetés.
+    """
+    xmin, ymin, xmax, ymax = emprise([anneaux[0]])
+    aire = abs(aire_signee(anneaux[0])) - sum(abs(aire_signee(t)) for t in anneaux[1:])
+    if aire <= 0:
+        return None
+    pas = max(0.1, math.sqrt(aire / max_points))
+    points = []
+    y = ymin + 0.5 * pas
+    while y < ymax:
+        for xa, xb in intervalles(anneaux, y):
+            x = xa + 0.5 * pas
+            while x < xb:
+                dans_stock = (zone_stock[0] <= x <= zone_stock[2] and zone_stock[1] <= y <= zone_stock[3]
+                              and point_dans(anneaux_stock, x, y))
+                if not dans_stock and not exclu(x, y):
+                    h = surface(x, y)
+                    if h is not None:
+                        points.append((x, y, h))
+                x += pas
+        y += pas
+    if len(points) < 10:
+        return None
+    modele, _ = ajustement_robuste(points, 1, rejet, k, seuil_min)
+    return modele
+
+
 def _troncons_ignores(echantillons, infos_parties, base):
     """Regroupe les échantillons de pied non retenus en tronçons (formes de contrôle)."""
     troncons = []
@@ -1135,17 +1251,127 @@ def _meme_crs(a, b):
     return _wkt(a) == _wkt(b)
 
 
-def _type_crs(crs):
-    w = _wkt(crs).upper()
+_WKT_PROJETE = ("PROJCS", "PROJCRS", "PROJECTEDCRS")
+_WKT_GEOGRAPHIQUE = ("GEOGCS", "GEOGCRS", "GEODCRS", "GEOGRAPHICCRS", "GEODETICCRS")
+_WKT_LOCAL = ("LOCAL_CS", "ENGCRS", "ENGINEERINGCRS")
+_WKT_VERTICAL = ("VERT_CS", "VERTCRS", "VERTICALCRS")
+_WKT_COMPOSE = ("COMPD_CS", "COMPOUNDCRS")
+_WKT_UNITE = ("UNIT", "LENGTHUNIT")
+
+
+def arbre_wkt(texte):
+    """Découpe un WKT (1 ou 2) en nœuds (MOT-CLÉ, [enfants])."""
+    racine = ("", [])
+    pile = [racine]
+    jeton = ""
+    i, n = 0, len(texte)
+    while i < n:
+        c = texte[i]
+        if c == '"':
+            fin = texte.find('"', i + 1)
+            while fin != -1 and fin + 1 < n and texte[fin + 1] == '"':  # guillemet doublé
+                fin = texte.find('"', fin + 2)
+            if fin == -1:
+                break
+            pile[-1][1].append(texte[i + 1:fin].replace('""', '"'))
+            jeton = ""
+            i = fin + 1
+            continue
+        if c in "[(":
+            noeud = (jeton.strip().upper(), [])
+            pile[-1][1].append(noeud)
+            pile.append(noeud)
+            jeton = ""
+        elif c in "])":
+            if jeton.strip():
+                pile[-1][1].append(jeton.strip())
+            jeton = ""
+            if len(pile) > 1:
+                pile.pop()
+        elif c == ",":
+            if jeton.strip():
+                pile[-1][1].append(jeton.strip())
+            jeton = ""
+        else:
+            jeton += c
+        i += 1
+    return racine[1]
+
+
+def _composantes_crs(noeuds):
+    sortie = []
+    for noeud in noeuds:
+        if isinstance(noeud, tuple):
+            if noeud[0] in _WKT_COMPOSE:
+                sortie.extend(_composantes_crs(noeud[1]))
+            else:
+                sortie.append(noeud)
+    return sortie
+
+
+def _facteur_unite(noeud):
+    """Facteur de conversion en mètres de l'unité de longueur d'un nœud de SCR."""
+    unites = [e for e in noeud[1] if isinstance(e, tuple) and e[0] in _WKT_UNITE]
+    if not unites:  # WKT2 : unité portée par le système d'axes
+        for e in noeud[1]:
+            if isinstance(e, tuple) and e[0] in ("CS", "AXIS"):
+                unites += [u for u in e[1] if isinstance(u, tuple) and u[0] in _WKT_UNITE]
+    for u in unites:
+        valeurs = [v for v in u[1] if not isinstance(v, tuple)]
+        if len(valeurs) >= 2:
+            f = nombre(valeurs[1])
+            if f and f > 0:
+                return f
+    return None
+
+
+def infos_crs(crs):
+    """(type, facteur plan -> m, facteur altitude -> m) d'un système de coordonnées.
+
+    type : « projete », « geographique » ou « local ». Fonctionne pour tout SCR
+    décrit en WKT : projeté (Lambert-93, CC42 à CC50, UTM...), géographique
+    (WGS 84, RGF93...), local, composé avec un système d'altitude (NGF-IGN69...).
+    """
+    w = _wkt(crs)
     if not w:
-        return "local"
-    if "PROJCS" in w or "PROJCRS" in w:
-        return "projete"
-    if "LOCAL_CS" in w or "ENGCRS" in w:
-        return "local"
-    if "GEOGCS" in w or "GEOGCRS" in w or "GEODCRS" in w:
-        return "geographique"
-    return "projete"
+        return "local", 1.0, 1.0
+    try:
+        composantes = _composantes_crs(arbre_wkt(w))
+    except Exception:
+        composantes = []
+    genre, fh, fv = None, 1.0, None
+    for noeud in composantes:
+        if noeud[0] in _WKT_PROJETE and genre is None:
+            genre, fh = "projete", _facteur_unite(noeud) or 1.0
+        elif noeud[0] in _WKT_GEOGRAPHIQUE and genre is None:
+            genre = "geographique"
+        elif noeud[0] in _WKT_LOCAL and genre is None:
+            genre, fh = "local", _facteur_unite(noeud) or 1.0
+        elif noeud[0] in _WKT_VERTICAL:
+            fv = _facteur_unite(noeud)
+    if genre is None:  # WKT non reconnu : recherche simple
+        haut = w.upper()
+        genre = ("projete" if "PROJ" in haut else "geographique" if "GEOG" in haut else "local")
+    if fv is None:
+        fv = 1.0 if genre == "geographique" else fh
+    return genre, fh, fv
+
+
+def _type_crs(crs):
+    return infos_crs(crs)[0]
+
+
+def _nom_crs(crs):
+    try:
+        nom = crs.name
+        if nom:
+            return nom
+    except Exception:
+        pass
+    noeuds = [n for n in arbre_wkt(_wkt(crs)) if isinstance(n, tuple)] if _wkt(crs) else []
+    if noeuds and noeuds[0][1] and not isinstance(noeuds[0][1][0], tuple):
+        return noeuds[0][1][0]
+    return "inconnu"
 
 
 class _Transfo(object):
@@ -1163,15 +1389,18 @@ class _Transfo(object):
 
 
 class Repere(object):
-    """Repère local métrique centré sur la zone de travail (SCR du MNE).
+    """Repère local en mètres centré sur la zone de travail (SCR du MNE).
 
-    En SCR géographique (degrés), une projection équirectangulaire locale est
-    utilisée (erreur négligeable à l'échelle d'un site).
+    SCR projeté ou local : les unités (pied US, etc.) sont converties en mètres.
+    SCR géographique (degrés) : projection équirectangulaire locale (erreur
+    négligeable à l'échelle d'un site). fz convertit les altitudes en mètres.
     """
 
     def __init__(self, crs_mne, x0, y0):
         self.x0, self.y0 = x0, y0
-        self.geographique = _type_crs(crs_mne) == "geographique"
+        genre, fh, fv = infos_crs(crs_mne)
+        self.geographique = genre == "geographique"
+        self.fz = fv
         if self.geographique:
             a, e2 = 6378137.0, 0.00669437999014
             phi = math.radians(y0)
@@ -1179,7 +1408,7 @@ class Repere(object):
             self.kx = math.radians(1.0) * a / w * math.cos(phi)
             self.ky = math.radians(1.0) * a * (1.0 - e2) / w ** 3
         else:
-            self.kx = self.ky = 1.0
+            self.kx = self.ky = fh
 
     def vers_local(self, x, y):
         return (x - self.x0) * self.kx, (y - self.y0) * self.ky
@@ -1196,8 +1425,8 @@ def _crs_mne(elevation):
     return crs
 
 
-def _fonction_mne(elevation, repere, transfo=None):
-    """Fonction (x, y) locales -> altitude du MNE (None si pas de donnée)."""
+def _fonction_mne(elevation, repere, transfo=None, facteur_z=1.0):
+    """Fonction (x, y) locales -> altitude du MNE en mètres (None si pas de donnée)."""
     altitude = elevation.altitude
     vecteur = Metashape.Vector
 
@@ -1214,7 +1443,7 @@ def _fonction_mne(elevation, repere, transfo=None):
         h = float(h)
         if h != h or h <= -32000.0 or h >= 1e9:
             return None
-        return h
+        return h * facteur_z
     return f
 
 
@@ -1223,7 +1452,7 @@ def _resolution_m(elevation, repere):
         r = float(elevation.resolution)
     except Exception:
         return 0.0
-    return r * repere.ky if repere.geographique else r
+    return r * repere.ky
 
 
 def _mnes(chunk):
@@ -1371,9 +1600,8 @@ def _construire_mne_filtre(chunk, cfg):
               "interpolation": Metashape.Interpolation.EnabledInterpolation}
     resolution = nombre(cfg.get("resolution_mne")) or 0.0
     if resolution > 0:
-        if _type_crs(chunk.crs) == "geographique":
-            resolution /= 111320.0
-        kwargs["resolution"] = resolution
+        genre, fh, _ = infos_crs(chunk.crs)
+        kwargs["resolution"] = resolution / (111320.0 if genre == "geographique" else fh)
     _log("Construction du MNE filtré (classes exclues : %s)..." % ", ".join(sorted(exclues)))
     if not hasattr(chunk, "elevations"):
         _log("ATTENTION : Metashape 1.x, le MNE existant du chunk est remplacé.")
@@ -1458,7 +1686,7 @@ def _creer_formes_controle(chunk, troncons_par_stock, repere, vers_formes):
             pts = []
             for (u, v, h) in t["points"]:
                 x, y = repere.vers_mne(u, v)
-                pts.append(Metashape.Vector(list(vers_formes(x, y, h))))
+                pts.append(Metashape.Vector(list(vers_formes(x, y, h / repere.fz))))
             forme = formes.addShape()
             forme.group = groupe
             forme.label = "%s - %s" % (nom, RAISONS_PIED.get(t["raison"], t["raison"]))
@@ -1483,6 +1711,8 @@ COLONNES_CSV = [
     ("Hauteur moy (m)", "hauteur_moy", 2),
     ("Altitude base moy (m)", "altitude_base_moy", 3),
     ("Pente base (%)", "pente_base_pct", 1),
+    ("Épaulements inclinés (pente)", "epaulements_inclines", None),
+    ("Base sur épaulement (%)", "base_epaulement_pct", 0),
     ("Pied utilisé (%)", "pied_retenu_pct", 0),
     ("Écart-type pied (m)", "ecart_type_pied", 3),
     ("Écart moyen pied/base (m)", "ecart_moyen_pied", 3),
@@ -1514,16 +1744,19 @@ def ecrire_csv(chemin, resultats, separateur=";", virgule=True, entete=None):
             for ligne in entete:
                 w.writerow([ligne])
             w.writerow([])
-        w.writerow([c[0] for c in COLONNES_CSV])
+        # Colonnes de tonnage seulement si une densité a été renseignée
+        colonnes = [c for c in COLONNES_CSV if c[1] not in ("densite", "tonnage")
+                    or any(r.get(c[1]) is not None for r in resultats)]
+        w.writerow([c[0] for c in colonnes])
         for r in resultats:
-            w.writerow([_format(r.get(cle), dec, virgule) for _, cle, dec in COLONNES_CSV])
+            w.writerow([_format(r.get(cle), dec, virgule) for _, cle, dec in colonnes])
         valides = [r for r in resultats if r.get("volume_net") is not None]
         total = {"nom": "TOTAL"}
         for cle in ("surface_2d", "volume_net", "volume_dessus", "volume_dessous"):
             total[cle] = sum(r[cle] for r in valides)
         tonnages = [r["tonnage"] for r in valides if r.get("tonnage") is not None]
         total["tonnage"] = sum(tonnages) if tonnages else None
-        w.writerow([_format(total.get(cle), dec, virgule) for _, cle, dec in COLONNES_CSV])
+        w.writerow([_format(total.get(cle), dec, virgule) for _, cle, dec in colonnes])
 
 
 def _chemin_csv(doc, chunk, cfg):
@@ -1585,7 +1818,8 @@ def executer(cfg=None, chunk=None):
         raise ErreurScript("Aucune forme dans le chunk : dessinez un polygone par stock "
                            "(de préférence dans un groupe « %s »)." % cfg["groupe_stocks"])
     debut = time.time()
-    _log("Volumes de stocks v%s - chunk « %s »" % (VERSION, _label(chunk, "chunk")))
+    _log("Volumes de stocks v%s - Metashape %s - chunk « %s »"
+         % (VERSION, getattr(Metashape.app, "version", "?"), _label(chunk, "chunk")))
     try:
         methode_normalisee(cfg["methode_base"])
     except ErreurStock as e:
@@ -1602,8 +1836,13 @@ def executer(cfg=None, chunk=None):
                            % ((" (« %s »)" % cfg["mne"]) if cfg.get("mne") else ""))
     crs_mne = _crs_mne(elevation) or chunk.crs
     crs_formes = chunk.shapes.crs or crs_mne
-    if _type_crs(crs_mne) == "geographique":
+    genre, fh, fv = infos_crs(crs_mne)
+    _log("SCR du MNE : %s (%s)" % (_nom_crs(crs_mne), genre))
+    if genre == "geographique":
         _log("MNE en coordonnées géographiques : conversion locale en mètres (un SCR projeté est conseillé).")
+    if abs(fh - 1.0) > 1e-9 or abs(fv - 1.0) > 1e-9:
+        _log("Unités du SCR converties en mètres (plan x %.10g, altitude x %.10g) : résultats en m3."
+             % (fh if genre != "geographique" else 1.0, fv))
     vers_mne = _Transfo(crs_formes, crs_mne)
     vers_formes = _Transfo(crs_mne, crs_formes)
 
@@ -1633,7 +1872,7 @@ def executer(cfg=None, chunk=None):
 
     g_excl = normaliser(cfg.get("groupe_exclusions") or "")
     g_ep = normaliser(cfg.get("groupe_epaulements") or "")
-    excl_mne, ep_lignes_mne, ep_polys_mne = [], [], []
+    excl_mne, ep_lignes_mne, ep_polys_mne, noms_ep = [], [], [], []
     for s in formes:
         grp = _groupe(s)
         if not grp or grp not in (g_excl, g_ep):
@@ -1644,6 +1883,7 @@ def executer(cfg=None, chunk=None):
         elif g_ep and grp == g_ep:
             if genre == "polygone":
                 ep_polys_mne.extend(en_mne(parties, True))
+                noms_ep.extend([_label(s) or "épaulement %d" % (len(noms_ep) + 1)] * len(parties))
             elif genre == "ligne":
                 ep_lignes_mne.extend(en_mne(parties, False))
     stocks_mne = [(s, en_mne(parties, True)) for s, (genre, parties) in stocks]
@@ -1663,10 +1903,10 @@ def executer(cfg=None, chunk=None):
     exclusions = local(excl_mne)
     ep_lignes = local(ep_lignes_mne, False)
     ep_polys = local(ep_polys_mne)
-    surface = _fonction_mne(elevation, repere)
+    surface = _fonction_mne(elevation, repere, None, repere.fz)
     resolution = _resolution_m(elevation, repere)
-    _log("MNE « %s » (résolution %.3f m), %d exclusion(s), %d épaulement(s)"
-         % (_label(elevation, "actif"), resolution, len(exclusions), len(ep_lignes) + len(ep_polys)))
+    _log("MNE « %s » (résolution %.3f m), %d exclusion(s), %d mur(s), %d talus / face(s) inclinée(s)"
+         % (_label(elevation, "actif"), resolution, len(exclusions), len(ep_lignes), len(ep_polys)))
 
     references = {}
 
@@ -1676,7 +1916,9 @@ def executer(cfg=None, chunk=None):
             if el_ref is None:
                 references[libelle] = None
             else:
-                references[libelle] = _fonction_mne(el_ref, repere, _Transfo(crs_mne, _crs_mne(el_ref)))
+                crs_ref = _crs_mne(el_ref) or crs_mne
+                references[libelle] = _fonction_mne(el_ref, repere, _Transfo(crs_mne, crs_ref),
+                                                    infos_crs(crs_ref)[2])
         return references[libelle]
 
     # MNE actif = MNE de calcul, pour le contrôle par le volume natif Metashape
@@ -1697,6 +1939,8 @@ def executer(cfg=None, chunk=None):
             params = dict(cfg)
             params.update(_parametres_forme(shape))
             params["resolution_mne_m"] = resolution
+            altitude = nombre(params.get("altitude_base"))
+            params["altitude_base"] = None if altitude is None else altitude * repere.fz
             t0 = time.time()
             try:
                 methode = methode_normalisee(params["methode_base"])
@@ -1708,7 +1952,8 @@ def executer(cfg=None, chunk=None):
                     if reference is None:
                         raise ErreurStock("MNE de référence « %s » introuvable" % params["mne_reference"])
                 r = calculer_stock(local(parties), surface, params, exclusions, ep_lignes, ep_polys,
-                                   reference, progression=lambda f: Metashape.app.update())
+                                   reference, progression=lambda f: Metashape.app.update(),
+                                   noms_epaulements=noms_ep)
             except ErreurStock as e:
                 r = {"methode": params.get("methode_base"), "alertes": ["ERREUR : %s" % e]}
                 _log("%s : ERREUR - %s" % (nom, e))
@@ -1794,6 +2039,9 @@ if QtWidgets is not None:
             form.addRow("Groupe exclusions :", self.exclusions)
             self.epaulements = self._combo([self.AUCUN] + groupes, cfg["groupe_epaulements"] or self.AUCUN, True)
             form.addRow("Groupe épaulements :", self.epaulements)
+            aide = QtWidgets.QLabel("   murs / blocs / roche verticale : LIGNES au pied du mur\n"
+                                    "   talus / roche inclinée : POLYGONE sur la face visible")
+            form.addRow("", aide)
 
             self.mne = self._combo([self.ACTIF] + mnes, cfg["mne"] or self.ACTIF)
             form.addRow("MNE du stock :", self.mne)
@@ -1819,8 +2067,6 @@ if QtWidgets is not None:
 
             self.pas = self._spin(cfg["pas_grille"], 0.0, 10.0, 3, " m  (0 = auto)")
             form.addRow("Pas de grille :", self.pas)
-            self.densite = self._spin(cfg["densite"], 0.0, 10.0, 3, " t/m³  (0 = pas de tonnage)")
-            form.addRow("Densité :", self.densite)
 
             ligne_csv = QtWidgets.QHBoxLayout()
             self.csv = QtWidgets.QLineEdit(cfg["fichier_csv"])
@@ -1890,7 +2136,6 @@ if QtWidgets is not None:
                 "mne_reference": texte(self.reference, self.AUCUN),
                 "rejet_points_hauts": self.rejet.isChecked(),
                 "pas_grille": self.pas.value(),
-                "densite": self.densite.value(),
                 "fichier_csv": self.csv.text().strip(),
                 "ecrire_attributs": self.attributs.isChecked(),
                 "formes_controle": self.controle.isChecked(),

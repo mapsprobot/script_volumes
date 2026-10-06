@@ -102,6 +102,66 @@ class TestGeometrie(unittest.TestCase):
         self.assertAlmostEqual(y, 48.86, places=9)
 
 
+GEOGCS_RGF93 = ('GEOGCS["RGF93 v1",DATUM["Reseau_Geodesique_Francais_1993_v1",SPHEROID["GRS 1980",6378137,'
+                '298.257222101,AUTHORITY["EPSG","7019"]],TOWGS84[0,0,0,0,0,0,0],AUTHORITY["EPSG","6171"]],'
+                'PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.01745329251994328,'
+                'AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4171"]]')
+CC47 = ('PROJCS["RGF93 v1 / CC47",' + GEOGCS_RGF93 + ',PROJECTION["Lambert_Conformal_Conic_2SP"],'
+        'PARAMETER["standard_parallel_1",46.25],PARAMETER["standard_parallel_2",47.75],'
+        'PARAMETER["latitude_of_origin",47],PARAMETER["central_meridian",3],PARAMETER["false_easting",1700000],'
+        'PARAMETER["false_northing",6200000],UNIT["metre",1,AUTHORITY["EPSG","9001"]],AUTHORITY["EPSG","3947"]]')
+CC47_NGF = ('COMPD_CS["RGF93 v1 / CC47 + NGF-IGN69 height",' + CC47 + ',VERT_CS["NGF-IGN69 height",'
+            'VERT_DATUM["Nivellement General de la France - IGN69",2005,AUTHORITY["EPSG","5119"]],'
+            'UNIT["metre",1,AUTHORITY["EPSG","9001"]],AXIS["Gravity-related height",UP],AUTHORITY["EPSG","5720"]]]')
+PIED_US = 0.304800609601219
+OHIO_FTUS = ('PROJCS["NAD83 / Ohio North (ftUS)",GEOGCS["NAD83",DATUM["North_American_Datum_1983",SPHEROID['
+             '"GRS 1980",6378137,298.257222101]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],'
+             'PROJECTION["Lambert_Conformal_Conic_2SP"],PARAMETER["false_easting",1968500],'
+             'UNIT["US survey foot",0.304800609601219,AUTHORITY["EPSG","9003"]],AXIS["X",EAST],AXIS["Y",NORTH],'
+             'AUTHORITY["EPSG","3734"]]')
+CC47_WKT2 = ('PROJCRS["RGF93 v1 / CC47",BASEGEOGCRS["RGF93 v1",DATUM["Reseau Geodesique Francais 1993 v1",'
+             'ELLIPSOID["GRS 1980",6378137,298.257222101,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,'
+             'ANGLEUNIT["degree",0.0174532925199433]],ID["EPSG",4171]],CONVERSION["CC47",METHOD['
+             '"Lambert Conic Conformal (2SP)",ID["EPSG",9802]]],CS[Cartesian,2],AXIS["easting (X)",east,ORDER[1],'
+             'LENGTHUNIT["metre",1]],AXIS["northing (Y)",north,ORDER[2],LENGTHUNIT["metre",1]],ID["EPSG",3947]]')
+WGS84 = ('GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],'
+         'UNIT["degree",0.0174532925199433]]')
+LOCAL = 'LOCAL_CS["Local Coordinates (m)",LOCAL_DATUM["Local Datum",0],UNIT["metre",1],AXIS["X",EAST],AXIS["Y",NORTH]]'
+
+
+class TestSystemesCoordonnees(unittest.TestCase):
+
+    def crs(self, wkt):
+        return type("CRS", (), {"wkt": wkt})()
+
+    def test_types_et_unites(self):
+        cas = [
+            (CC47, ("projete", 1.0, 1.0)),
+            (CC47_NGF, ("projete", 1.0, 1.0)),
+            (CC47_WKT2, ("projete", 1.0, 1.0)),
+            (OHIO_FTUS, ("projete", PIED_US, PIED_US)),
+            ('COMPD_CS["Ohio + NAVD88 (m)",' + OHIO_FTUS + ',VERT_CS["NAVD88",VERT_DATUM["NAVD88",2005],'
+             'UNIT["metre",1]]]', ("projete", PIED_US, 1.0)),
+            (WGS84, ("geographique", 1.0, 1.0)),
+            ('COMPD_CS["WGS 84 + EGM96",' + WGS84 + ',VERT_CS["EGM96",VERT_DATUM["EGM96",2005],UNIT["metre",1]]]',
+             ("geographique", 1.0, 1.0)),
+            (LOCAL, ("local", 1.0, 1.0)),
+            ("", ("local", 1.0, 1.0)),
+        ]
+        for wkt, attendu in cas:
+            genre, fh, fv = vs.infos_crs(self.crs(wkt))
+            self.assertEqual(genre, attendu[0], wkt[:40])
+            self.assertAlmostEqual(fh, attendu[1], places=12, msg=wkt[:40])
+            self.assertAlmostEqual(fv, attendu[2], places=12, msg=wkt[:40])
+        self.assertEqual(vs._nom_crs(self.crs(CC47_NGF)), "RGF93 v1 / CC47 + NGF-IGN69 height")
+
+    def test_repere_en_pieds(self):
+        rep = vs.Repere(self.crs(OHIO_FTUS), 1000.0, 2000.0)
+        u, v = rep.vers_local(1100.0, 2000.0)
+        self.assertAlmostEqual(u, 100 * PIED_US)
+        self.assertAlmostEqual(rep.fz, PIED_US)
+
+
 class TestVolumes(unittest.TestCase):
 
     def test_cone_sol_plat(self):
@@ -198,6 +258,62 @@ class TestVolumes(unittest.TestCase):
         r = vs.calculer_stock([[polygone]], f, params(methode_base="plan"))
         self.assertGreater(r["volume_net"], 1.3 * attendu)
         self.assertTrue(any("adossé" in a for a in r["alertes"]))
+
+    def test_talus_au_pied_cache(self):
+        """Stock adossé à un talus dont le pied est entièrement caché : la face
+        visible (polygone d'épaulement) est prolongée sous le stock."""
+        def sol(x, y):
+            return Z0 + 0.8 * max(0.0, x - 8.0)
+
+        def f(x, y):
+            dessus = Z0 + 4.0 - 0.7 * max(0.0, 6.0 - x) - 0.7 * max(0.0, 6.0 - y) - 0.7 * max(0.0, y - 24.0)
+            return max(sol(x, y), dessus)
+        stock = [(-1, -1), (13, -1), (13, 31), (-1, 31)]
+        face = [(13.5, -1), (17, -1), (17, 31), (13.5, 31)]
+        attendu = integrer(lambda x, y: f(x, y) - sol(x, y), -1, -1, 13, 31)
+        for methode in ("plan", "horizontal", "triangule", "altitude"):
+            r = vs.calculer_stock([[stock]], f, params(methode_base=methode, altitude_base=Z0),
+                                  epaulements_polygones=[[face]], noms_epaulements=["Talus"])
+            self.assertAlmostEqual(r["volume_net"], attendu, delta=0.01 * attendu, msg=methode)
+            self.assertEqual(r["epaulements_inclines"], ["Talus : 80 %"])
+            self.assertAlmostEqual(r["base_epaulement_pct"], 36.0, delta=3.0)
+            sans = vs.calculer_stock([[stock]], f, params(methode_base=methode, altitude_base=Z0))
+            self.assertGreater(abs(sans["volume_net"] - attendu), 0.3 * attendu, msg=methode)
+
+    def test_alveole_deux_faces(self):
+        """Stock dans l'angle de deux talus (alvéole) : base = sol ou faces prolongées."""
+        def sol(x, y):
+            return Z0 + max(0.0, 0.8 * (x - 8.0), 1.2 * (y - 10.0))
+
+        def f(x, y):
+            return max(sol(x, y), Z0 + 4.0 - 0.7 * max(0.0, 6.0 - x) - 0.7 * max(0.0, 4.0 - y))
+        stock = [(-1, -1), (13, -1), (13, 13.33), (-1, 13.33)]
+        faces = [[[(13.5, -1), (17, -1), (17, 12), (13.5, 12)]],
+                 [[(-1, 13.8), (12, 13.8), (12, 16), (-1, 16)]]]
+        attendu = integrer(lambda x, y: f(x, y) - sol(x, y), -1, -1, 13, 13.33, 0.02)
+        r = vs.calculer_stock([[stock]], f, params(), epaulements_polygones=faces)
+        self.assertAlmostEqual(r["volume_net"], attendu, delta=0.015 * attendu)
+        self.assertEqual(len(r["epaulements_inclines"]), 2)
+
+    def test_epaulement_plat_ou_eloigne(self):
+        def f(x, y):
+            return cone(x, y) + (3.0 if x > 14 else 0.0)  # dessus de blocs plat
+        plat = [[(14.5, -5), (16, -5), (16, 5), (14.5, 5)]]
+        r = vs.calculer_stock([[cercle(12.0)]], f, params(), epaulements_polygones=[plat],
+                              noms_epaulements=["Blocs"])
+        self.assertAlmostEqual(r["volume_net"], V_CONE, delta=0.01 * V_CONE)
+        self.assertIsNone(r["epaulements_inclines"])
+        self.assertTrue(any("Blocs" in a and "horizontal" in a for a in r["alertes"]))
+        loin = [[(40, -5), (45, -5), (45, 5), (40, 5)]]
+        r = vs.calculer_stock([[cercle(12.0)]], cone, params(), epaulements_polygones=[loin])
+        self.assertIsNone(r["epaulements_inclines"])
+        self.assertEqual(r["alertes"], [])
+
+    def test_distance_polygones(self):
+        a = [[(0, 0), (10, 0), (10, 2), (0, 2)]]
+        self.assertAlmostEqual(vs.distance_polygones(a, [[(13, 0), (15, 0), (15, 2), (13, 2)]]), 3.0)
+        croix = [[(4, -5), (6, -5), (6, 7), (4, 7)]]  # se croisent sans sommet intérieur
+        self.assertEqual(vs.distance_polygones(a, croix), 0.0)
 
     def test_exclusion_arbre(self):
         def f(x, y):
